@@ -13,7 +13,7 @@ Open `index.html` in a browser. That's it — it works over `file://`, so you ca
 | `space` / `←` `→` | next / previous effect |
 | `R` | random effect |
 | `P` | hold on the current effect (stop auto-advance) |
-| `N` | toggle the effect-name flash |
+| `I` | show the current effect's name (fades out) |
 | `F` | fullscreen |
 | `1`–`9` | jump to one of the first nine |
 

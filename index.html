@@ -10,7 +10,7 @@
   #hud.on{opacity:.75}
 </style>
 <canvas id="c"></canvas>
-<div id="hud">256 EFFECTS &middot; SPACE/&larr;&rarr; scene &middot; R random &middot; P hold &middot; N names &middot; F fullscreen</div>
+<div id="hud">256 EFFECTS &middot; SPACE/&larr;&rarr; scene &middot; I name &middot; R random &middot; P hold &middot; F fullscreen</div>
 <script>
 (() => {
 "use strict";
@@ -5549,7 +5549,6 @@ enter(0);
 function jump(i){
   cur = ((i % scenes.length) + scenes.length) % scenes.length;
   nxt = -1; curStart = now(); enter(cur);
-  flash(scenes[cur].name);
 }
 function now(){ return performance.now()/1000 - started; }
 
@@ -5575,7 +5574,6 @@ function frame(){
   if (!hold && local >= LEN){
     cur = nxt < 0 ? (cur+1)%scenes.length : nxt;
     nxt = -1; curStart = t;
-    if (showNames) flash(scenes[cur].name);
   }
 
   drawFlash(A, t);
@@ -5583,21 +5581,34 @@ function frame(){
   ctx.putImageData(imgA, 0, 0);
 }
 
-// tiny scene-name flash
-let flashText = null, flashT = -99, flashMask = null, showNames = true;
-function flash(txt){ flashText = txt; flashT = now(); flashMask = textMask(txt, 12); }
+// opt-in effect-name overlay - press I. Nothing is shown unless asked for.
+let flashT = -99, flashMask = null;
+function flash(txt){ flashT = now(); flashMask = textMask(txt, 12); }
 function drawFlash(T, t){
-  if (!flashMask || !showNames) return;
+  if (!flashMask) return;
+  const IN = 0.10, HOLD = 1.7, OUT = 1.2;
   const age = t - flashT;
-  if (age > 2.2) return;
-  const a = age < 1.6 ? 1 : (2.2-age)/0.6;
-  if (((t*12)|0 & 1) && age > 1.6) return;
-  const m = flashMask, ox = 6, oy = 6;
-  const col = rgb((255*a)|0,(255*a)|0,(120*a)|0);
+  if (age < 0 || age > IN + HOLD + OUT) return;
+  let a = age < IN ? age/IN : (age < IN + HOLD ? 1 : 1 - (age - IN - HOLD)/OUT);
+  a = clamp(a, 0, 1);
+  a = a*a*(3-2*a);                         // smoothstep, so it eases out
+  const m = flashMask, ox = 6, oy = 6, sh = a*0.72;
+  // shadow first, so the label stays readable over bright effects
+  for (let y=0;y<m.h;y++) for (let x=0;x<m.w;x++){
+    if (!m.a[y*m.w+x]) continue;
+    const px=ox+x+1, py=oy+y+1;
+    if (px>=W||py>=H) continue;
+    const i=py*W+px, c=T[i];
+    T[i]=rgb(((c&255)*(1-sh))|0, (((c>>8)&255)*(1-sh))|0, (((c>>16)&255)*(1-sh))|0);
+  }
   for (let y=0;y<m.h;y++) for (let x=0;x<m.w;x++){
     if (!m.a[y*m.w+x]) continue;
     const px=ox+x, py=oy+y;
-    if (px<W&&py<H) T[py*W+px]=col;
+    if (px>=W||py>=H) continue;
+    const i=py*W+px, c=T[i];
+    T[i]=rgb((( c     &255)+(255-( c     &255))*a)|0,
+             (((c>>8) &255)+(255-((c>>8) &255))*a)|0,
+             (((c>>16)&255)+(130-((c>>16)&255))*a)|0);
   }
 }
 
@@ -5627,7 +5638,7 @@ addEventListener('keydown', e => {
   else if (k >= '1' && k <= '9'){ const i = +k - 1; if (i < scenes.length) jump(i); }
   else if (k === 'f'){ if (!document.fullscreenElement) document.documentElement.requestFullscreen(); else document.exitFullscreen(); }
   else if (k === 'h'){ showHud(); }
-  else if (k === 'n'){ showNames = !showNames; }
+  else if (k === 'i'){ flash(scenes[cur].name); }
   else if (k === 'r'){ jump((Math.random()*scenes.length)|0); }
   else if (k === 'p'){ hold = !hold; flash(hold?'HOLD':'AUTO'); }
   else if (k === 'arrowleft'){ jump(cur-1); }

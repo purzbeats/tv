@@ -34,7 +34,7 @@ All code lives in one IIFE inside `index.html`, in this order:
    - d3 + part + misc (32) — wireframe/solid 3D, particle systems, attractors, screen effects
 5. **Running order.** Scenes are interleaved round-robin by `tag` so neighbouring parts never come from the same family. Adding a scene with a known tag slots it in automatically; an unknown tag is appended as its own family.
 6. **Sequencer.** `LEN=15s` per scene, `TRANS=1.3s` Bayer-dither dissolve (a full cycle is ~64 minutes). During a transition the outgoing scene draws into `A`, the incoming into `B`, and pixels are swapped where `bay(x,y) < threshold`.
-7. **Layout + input.** `fit()` computes an integer (or half-step) CSS scale on resize. `window.__demo = { jump, scenes, names }` is exposed purely as a test hook.
+7. **Layout + input.** Nothing is drawn over an effect unless the viewer asks: `I` calls `flash()`, which alpha-blends the current effect's name (plus a drop shadow, so it survives bright scenes) over the frame and eases it out over ~3s. Scene changes are deliberately silent — this is an ambient display first. `fit()` computes an integer (or half-step) CSS scale on resize. `window.__demo = { jump, scenes, names }` is exposed purely as a test hook.
 
 ### The scene contract
 
