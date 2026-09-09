@@ -68,25 +68,102 @@ const BY = new Uint8Array([
   63,31,55,23,61,29,53,21]);
 const bay = (x,y) => BY[((y&7)<<3)|(x&7)];
 
-// ---------------------------------------------------------------- text masks
-const tcv = document.createElement('canvas');
-const tcx = tcv.getContext('2d', { willReadFrequently:true });
-function textMask(str, px, font) {
-  tcx.font = `bold ${px}px ${font||'monospace'}`;
-  const w = Math.ceil(tcx.measureText(str).width) + 4;
-  const h = px + 6;
-  tcv.width = w; tcv.height = h;
-  tcx.font = `bold ${px}px ${font||'monospace'}`;
-  tcx.textBaseline = 'top';
-  tcx.clearRect(0,0,w,h);
-  tcx.fillStyle = '#fff';
-  tcx.fillText(str, 2, 3);
-  const d = tcx.getImageData(0,0,w,h).data;
+// ---------------------------------------------------------------- bitmap font
+// 5x7 glyphs. Crisp at any scale - a browser font thresholded at this size
+// loses its thin stems, which is what turned small labels to mush.
+const GLYPH = {
+' ':'..... ..... ..... ..... ..... ..... .....',
+'!':'..#.. ..#.. ..#.. ..#.. ..#.. ..... ..#..',
+'"':'.#.#. .#.#. ..... ..... ..... ..... .....',
+'#':'.#.#. .#.#. ##### .#.#. ##### .#.#. .#.#.',
+'$':'..#.. .#### #.#.. .###. ..#.# ####. ..#..',
+'%':'##..# ##..# ...#. ..#.. .#... #..## #..##',
+'&':'.##.. #..#. #.#.. .#... #.#.# #..#. .##.#',
+"'":'..#.. ..#.. ..... ..... ..... ..... .....',
+'(':'...#. ..#.. .#... .#... .#... ..#.. ...#.',
+')':'.#... ..#.. ...#. ...#. ...#. ..#.. .#...',
+'*':'..... #.#.# .###. ##### .###. #.#.# .....',
+'+':'..... ..#.. ..#.. ##### ..#.. ..#.. .....',
+',':'..... ..... ..... ..... ..... ..##. ..#..',
+'-':'..... ..... ..... ##### ..... ..... .....',
+'.':'..... ..... ..... ..... ..... .##.. .##..',
+'/':'....# ...#. ..#.. ..#.. .#... #.... .....',
+'0':'.###. #...# #..## #.#.# ##..# #...# .###.',
+'1':'..#.. .##.. ..#.. ..#.. ..#.. ..#.. .###.',
+'2':'.###. #...# ....# ...#. ..#.. .#... #####',
+'3':'##### ...#. ..##. ....# ....# #...# .###.',
+'4':'...#. ..##. .#.#. #..#. ##### ...#. ...#.',
+'5':'##### #.... ####. ....# ....# #...# .###.',
+'6':'..##. .#... #.... ####. #...# #...# .###.',
+'7':'##### ....# ...#. ..#.. .#... .#... .#...',
+'8':'.###. #...# #...# .###. #...# #...# .###.',
+'9':'.###. #...# #...# .#### ....# ...#. .##..',
+':':'..... .##.. .##.. ..... .##.. .##.. .....',
+';':'..... .##.. .##.. ..... .##.. ..#.. .#...',
+'<':'...#. ..#.. .#... #.... .#... ..#.. ...#.',
+'=':'..... ..... ##### ..... ##### ..... .....',
+'>':'.#... ..#.. ...#. ....# ...#. ..#.. .#...',
+'?':'.###. #...# ....# ...#. ..#.. ..... ..#..',
+'@':'.###. #...# #.### #.#.# #.### #.... .###.',
+'A':'.###. #...# #...# ##### #...# #...# #...#',
+'B':'####. #...# #...# ####. #...# #...# ####.',
+'C':'.###. #...# #.... #.... #.... #...# .###.',
+'D':'###.. #..#. #...# #...# #...# #..#. ###..',
+'E':'##### #.... #.... ####. #.... #.... #####',
+'F':'##### #.... #.... ####. #.... #.... #....',
+'G':'.###. #...# #.... #.### #...# #...# .####',
+'H':'#...# #...# #...# ##### #...# #...# #...#',
+'I':'.###. ..#.. ..#.. ..#.. ..#.. ..#.. .###.',
+'J':'..### ...#. ...#. ...#. ...#. #..#. .##..',
+'K':'#...# #..#. #.#.. ##... #.#.. #..#. #...#',
+'L':'#.... #.... #.... #.... #.... #.... #####',
+'M':'#...# ##.## #.#.# #.#.# #...# #...# #...#',
+'N':'#...# #...# ##..# #.#.# #..## #...# #...#',
+'O':'.###. #...# #...# #...# #...# #...# .###.',
+'P':'####. #...# #...# ####. #.... #.... #....',
+'Q':'.###. #...# #...# #...# #.#.# #..#. .##.#',
+'R':'####. #...# #...# ####. #.#.. #..#. #...#',
+'S':'.#### #.... #.... .###. ....# ....# ####.',
+'T':'##### ..#.. ..#.. ..#.. ..#.. ..#.. ..#..',
+'U':'#...# #...# #...# #...# #...# #...# .###.',
+'V':'#...# #...# #...# #...# #...# .#.#. ..#..',
+'W':'#...# #...# #...# #.#.# #.#.# ##.## #...#',
+'X':'#...# #...# .#.#. ..#.. .#.#. #...# #...#',
+'Y':'#...# #...# .#.#. ..#.. ..#.. ..#.. ..#..',
+'Z':'##### ....# ...#. ..#.. .#... #.... #####',
+'[':'.###. .#... .#... .#... .#... .#... .###.',
+']':'.###. ...#. ...#. ...#. ...#. ...#. .###.',
+'^':'..#.. .#.#. #...# ..... ..... ..... .....',
+'_':'..... ..... ..... ..... ..... ..... #####'
+};
+GLYPH[String.fromCharCode(92)]='#.... .#... ..#.. ..#.. ...#. ....# .....';
+const FONTBITS = {};
+for (const k in GLYPH){
+  const rows = GLYPH[k].split(' ');
+  const a = new Uint8Array(35);
+  for (let y=0;y<7;y++) for (let x=0;x<5;x++) a[y*5+x] = rows[y][x]==='#' ? 1 : 0;
+  FONTBITS[k] = a;
+}
+// px is the requested cap height; glyphs snap to whole-pixel multiples of 5x7
+function textMask(str, px) {
+  const s = Math.max(1, Math.round((px||8)/8));
+  const gap = Math.max(1, s-1);                 // tight: gap grows slower than the glyph
+  const gh=7*s, adv=5*s+gap;
+  const w = Math.max(1, str.length*adv - gap), h = gh;
   const a = new Uint8Array(w*h);
-  for (let i=0;i<w*h;i++) a[i] = d[i*4+3] > 110 ? 1 : 0;
+  for (let i=0;i<str.length;i++){
+    const g = FONTBITS[str[i].toUpperCase()] || FONTBITS[' '];
+    const ox = i*adv;
+    for (let y=0;y<7;y++) for (let x=0;x<5;x++){
+      if (!g[y*5+x]) continue;
+      for (let sy=0;sy<s;sy++) for (let sx=0;sx<s;sx++){
+        const px2=ox+x*s+sx, py2=y*s+sy;
+        if (px2<w && py2<h) a[py2*w+px2]=1;
+      }
+    }
+  }
   return { w, h, a };
 }
-
 
 // ---------------------------------------------------------------- raster helpers
 function line(T,x0,y0,x1,y1,col){
@@ -163,8 +240,7 @@ function fbm(x,y,oct){
   return s;
 }
 
-
-// ---------------------------------------------------------------- pixel ops
+// ---------------------------------------------------------------- pixel ops// ---------------------------------------------------------------- pixel ops
 function pset(T,x,y,c){ x=x|0;y=y|0; if(x>=0&&y>=0&&x<W&&y<H) T[y*W+x]=c; }
 function pget(T,x,y){ x=x|0;y=y|0; return (x>=0&&y>=0&&x<W&&y<H)?T[y*W+x]:0xff000000; }
 function hline(T,x0,x1,y,c){ y=y|0; if(y<0||y>=H)return; if(x0>x1){const t=x0;x0=x1;x1=t;}
@@ -1503,18 +1579,18 @@ const TAU = Math.PI*2;
   /* 1 boot screen */
   {
     let m=null;
-    const L=['    **** COMMODORE 64 BASIC V2 ****','',' 64K RAM SYSTEM  38911 BASIC BYTES FREE','','READY.'];
+    const L=['*** COMMODORE 64 BASIC V2 ***','','64K RAM  38911 BASIC BYTES FREE','','READY.'];
     scenes.push({name:'C64BOOT',tag:'c64',
       reset(){ if(!m) m=L.map(s=>textMask(s,8)); },
       draw(T,t){ if(!m)this.reset();
         T.fill(C64[6]); rect(T,10,8,W-20,H-16,C64[14]);
         for(let i=0;i<m.length;i++){ const k=m[i];
-          for(let y=0;y<k.h;y++)for(let x=0;x<k.w;x++) if(k.a[y*k.w+x]) pset(T,16+x,16+i*10+y,C64[14+0]===0?C64[1]:C64[3]); }
+          for(let y=0;y<k.h;y++)for(let x=0;x<k.w;x++) if(k.a[y*k.w+x]) pset(T,12+x,16+i*10+y,C64[3]); }
         const typ='LOAD"*",8,1';
         const n=clamp(((t*4)%18)|0,0,typ.length);
         const tm=textMask(typ.slice(0,n),8);
-        for(let y=0;y<tm.h;y++)for(let x=0;x<tm.w;x++) if(tm.a[y*tm.w+x]) pset(T,16+x,16+5*10+y,C64[3]);
-        if(((t*2)|0)&1) rect(T,17+n*5,16+5*10,5,8,C64[3]);
+        for(let y=0;y<tm.h;y++)for(let x=0;x<tm.w;x++) if(tm.a[y*tm.w+x]) pset(T,12+x,16+5*10+y,C64[3]);
+        if(((t*2)|0)&1) rect(T,13+n*6,16+5*10,5,7,C64[3]);
       }});
   }
 
@@ -2010,7 +2086,7 @@ const TAU = Math.PI*2;
 
   /* 5 status bar + split scroll */
   { let m=null;
-    scenes.push({name:'NESHUD',tag:'nes',reset(){m=textMask('MARIO 000350   WORLD 1-1   TIME 287',8);},
+    scenes.push({name:'NESHUD',tag:'nes',reset(){m=textMask('MARIO 000350  W 1-1  TIME 287',8);},
       draw(T,t){ if(!m)this.reset();
         rect(T,0,0,W,26,N[0]);
         for(let y=0;y<m.h;y++)for(let x=0;x<m.w;x++) if(m.a[y*m.w+x]) pset(T,6+x,8+y,N[1]);
@@ -2995,7 +3071,7 @@ const TAU = Math.PI*2;
         rect(T,0,0,W,10,rgb(200,200,210));
         for(let y=0;y<8;y++)for(let x=0;x<40;x++) if((x+y)%3===0) pset(T,4+x,1+y,rgb(120,120,140));
         for(let i=0;i<3;i++){
-          const x=W-46, y=16+i*40;
+          const x=W-58, y=16+i*40;
           rect(T,x,y,30,22,rgb(230,230,240)); box2(T,x,y,30,22,rgb(30,30,50));
           rect(T,x+4,y+4,10,8,rgb(120,140,220));
           const k=m[i];
@@ -3441,7 +3517,7 @@ const TAU = Math.PI*2;
   /* 27 disk mag page */
   { let m=null;
     scenes.push({name:'DISKMAG',tag:'amiga',
-      reset(){ m=[textMask('THE PIXEL POST',14),textMask('ISSUE #12  -  SCENE NEWS',8)]; },
+      reset(){ m=[textMask('THE PIXEL POST',14),textMask('ISSUE #12 - SCENE NEWS',8)]; },
       draw(T,t){ if(!m)this.reset();
         T.fill(rgb(16,16,40));
         rect(T,0,0,W,26,rgb(200,40,90));
@@ -5412,7 +5488,7 @@ const TAU = Math.PI*2;
 
   /* 31 BIOS boot */
   { let m=null;
-    const L=['CRT BIOS v2.56  (C) 1994','','Main Processor  : 6510 @ 1.02 MHz','Memory Test     : 65536K OK','Video Adapter   : 200x150 RGB','Fixed Disk 0    : NONE','','Detecting demo effects ... 256 found','','Booting from CRT0:'];
+    const L=['CRT BIOS v2.56  (C) 1994','','CPU      : 6510 @ 1.02 MHZ','MEMORY   : 65536K OK','VIDEO    : 200X150 RGB','DISK 0   : NONE','','EFFECTS  : 256 FOUND','','BOOTING FROM CRT0:'];
     scenes.push({name:'BIOSBOOT',tag:'misc',reset(){ if(!m) m=L.map(s=>textMask(s,8)); },
       draw(T,t){ if(!m)this.reset();
         T.fill(rgb(0,0,0));

@@ -22,7 +22,7 @@ All code lives in one IIFE inside `index.html`, in this order:
 
 1. **Framebuffer.** `W=200, H=150`. `imgA`/`A` are an `ImageData` and a `Uint32Array` view over the same bytes; `B` is a second scene buffer used only during transitions. Pixels are packed little-endian ABGR by `rgb(r,g,b)` — blue is the high byte.
 2. **Palettes.** `pal()` (cosine gradient), `stops()` (keyed gradient), `hexpal()` (0xRRGGBB list) all return `Uint32Array` lookup tables; most scenes quantize a float into a palette index, which is what produces the banded retro look. Hardware palettes `C64`, `NESP`, `GB`, `ZX`, `CGA`, `AMI` are the real thing — use them for platform-flavoured scenes instead of inventing colours. `BY`/`bay(x,y)` is the 8x8 ordered dither matrix, used both for shading and for the scene transition.
-3. **Helpers.** `textMask(str,px)` rasterizes text through an offscreen canvas into a 1-bit mask — the only text mechanism, there is no bitmap font. `spr(rows)` builds a sprite from ASCII-art strings (`.`/space transparent, digits = palette index) and `blit`/`blit2` draw it. Drawing: `pset/pget/hline/vline/rect/box2/disc/ring/line/tri/addp/fadeBuf/vgrad`. Noise: `hash2/vnoise/fbm`. All take the target buffer first.
+3. **Helpers.** `textMask(str,px)` renders text from the built-in **5x7 bitmap font** (`GLYPH`) into a 1-bit mask — the only text mechanism. `px` is a requested cap height that snaps to a whole-pixel scale (`s = round(px/8)`), so glyphs are always integer multiples of 5x7 and stay crisp. Advance is `5*s + max(1,s-1)` — monospace, which is what keeps the terminal-style screens (BIOSBOOT, BASICLIST, SNESMENU, NESSHOP) column-aligned. At 6px per character a line fits ~32 characters; longer strings clip. `spr(rows)` builds a sprite from ASCII-art strings (`.`/space transparent, digits = palette index) and `blit`/`blit2` draw it. Drawing: `pset/pget/hline/vline/rect/box2/disc/ring/line/tri/addp/fadeBuf/vgrad`. Noise: `hash2/vnoise/fbm`. All take the target buffer first.
 4. **Scenes**, grouped into packs, each pack in its own block scope so its shared tables and local helpers stay private:
    - core (32) — the original demo effects: plasma, tunnels, fire, raymarching, fractals, VHS
    - c64 (32) — PETSCII, DYCP, FLD, Kefrens, raster bars, colour clash, boot screens
@@ -57,6 +57,7 @@ Scenes needing frame-to-frame persistence (FEEDBACK, VECTORS, SHADEBOBS, ATTRACT
 
 - **`|` binds looser than arithmetic.** `(H*0.7)|0-(y-4)` parses as `(H*0.7) | (0-(y-4))`. Parenthesize every `|0` used inside an expression.
 - **Fractional array indices silently do nothing.** `T[y*W+x] = c` with float `x`/`y` writes nowhere. Use `pset` or coerce with `|0` — an inline `add()` helper in COLORMATH lost its output this way.
+- **Text was previously rasterized from a browser font and thresholded at alpha > 110**, which ate the thin stems of small glyphs and turned labels to mush. It is now a hand-authored bitmap font; don't reintroduce canvas text rendering.
 - **`hash2` must stay well-mixed.** The original multiply-shift version only ever returned 0.0–0.6, which silently flattened `fbm`, the voxel terrain and every hash-driven tile map. It now uses `Math.imul` mixing; verify distribution if you touch it.
 
 ## Verifying changes

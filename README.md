@@ -21,7 +21,7 @@ Effects run 15s each with a Bayer-dither dissolve between them. A full cycle is 
 
 ## What's in it
 
-Every effect is written from scratch against a `Uint32Array` framebuffer — no canvas drawing APIs beyond `putImageData`, no WebGL, no libraries. Expensive effects (raymarching, fractals, cellular automata) render at 100×75 into 2×2 blocks to hold 60fps.
+Every effect is written from scratch against a `Uint32Array` framebuffer — no canvas drawing APIs beyond `putImageData`, no WebGL, no libraries. Text uses a hand-authored 5x7 bitmap font so it stays crisp at 200x150. Expensive effects (raymarching, fractals, cellular automata) render at 100×75 into 2×2 blocks to hold 60fps.
 
 The running order interleaves families round-robin, so consecutive effects never come from the same one.
 
