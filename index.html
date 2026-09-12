@@ -56,6 +56,15 @@ function stops(n, st){
   return p;
 }
 
+// Quantised colour ramp over a scalar range. Most of the plasma family ends in
+// "sum three sines, then three more sines to make an rgb()". Baking the second
+// half into a table turns that tail into a single array index.
+function ramp(n, lo, hi, fn){
+  const p = new Uint32Array(n+1);
+  for (let i=0;i<=n;i++) p[i] = fn(lo + (hi-lo)*i/n);
+  return p;
+}
+
 // 8x8 ordered dither matrix (0..63)
 const BY = new Uint8Array([
    0,32, 8,40, 2,34,10,42,
@@ -240,7 +249,40 @@ function fbm(x,y,oct){
   return s;
 }
 
-// ---------------------------------------------------------------- pixel ops// ---------------------------------------------------------------- pixel ops
+// ---------------------------------------------------------------- fast math
+// Per-pixel Math.sin was by far the largest single cost in this file: the
+// plasma-family effects call it 5-8 times per pixel, which is ~200k libm calls
+// a frame. A table lookup is ~20x cheaper and the error (<5e-4) is three
+// orders of magnitude below what a 200x150 buffer with a 64-entry palette can
+// actually show. Geometry uses it too - at this resolution 5e-4 rad is 1e-4
+// of a pixel.
+// Phase note: the index is truncated with |0, which is exact until the
+// argument exceeds ~1.6e6 radians (about 19 days of uptime at these rates).
+// Past that ToInt32 wraps and the phase jumps - it stays a valid index, so
+// the effect keeps running, it just re-rolls its phase. Math.sin loses
+// precision out there anyway.
+const TRIG_N = 8192, TRIG_MASK = TRIG_N - 1, TRIG_Q = TRIG_N >> 2;
+const TRIG_SC = TRIG_N / (Math.PI * 2);
+const SINT = new Float32Array(TRIG_N + TRIG_Q);
+for (let i = 0; i < SINT.length; i++) SINT[i] = Math.sin(i * (Math.PI * 2 / TRIG_N));
+const fsin = a => SINT[((a * TRIG_SC) | 0) & TRIG_MASK];
+const fcos = a => SINT[((((a * TRIG_SC) | 0) & TRIG_MASK)) + TRIG_Q];
+
+// Polynomial atan2, max error ~1e-3 rad. Used where the angle only ever
+// feeds a palette index or a mirrored wedge.
+function fatan2(y, x){
+  const ay = y < 0 ? -y : y, ax = x < 0 ? -x : x;
+  const d = (ay > ax ? ay : ax);
+  if (d === 0) return 0;
+  const z = (ay < ax ? ay : ax) / d;
+  // atan(z) for z in [0,1]
+  let r = z * (0.7853981634 - (z - 1) * (0.2447 + 0.0663 * z));
+  if (ay > ax) r = 1.5707963268 - r;
+  if (x < 0) r = 3.1415926536 - r;
+  return y < 0 ? -r : r;
+}
+
+// ---------------------------------------------------------------- pixel ops
 function pset(T,x,y,c){ x=x|0;y=y|0; if(x>=0&&y>=0&&x<W&&y<H) T[y*W+x]=c; }
 function pget(T,x,y){ x=x|0;y=y|0; return (x>=0&&y>=0&&x<W&&y<H)?T[y*W+x]:0xff000000; }
 function hline(T,x0,x1,y,c){ y=y|0; if(y<0||y>=H)return; if(x0>x1){const t=x0;x0=x1;x1=t;}
@@ -295,19 +337,20 @@ const TAU = Math.PI*2;
     const ex=x-W*0.18, ey=y-H*0.85;
     dist2[i]=Math.sqrt(ex*ex+ey*ey);
   }
+  const PL_AX = new Float32Array(W), PL_AD = new Float32Array(W+H);
   scenes.push({ name:'PLASMA', draw(T,t){
     const p = (t%24) < 12 ? P : P2;
     const s1=Math.sin(t*0.31)*0.05+0.09, s2=Math.cos(t*0.23)*0.04+0.10;
+    for (let x=0;x<W;x++)   PL_AX[x] = fsin(x*s1 + t*1.7);
+    for (let k=0;k<W+H;k++) PL_AD[k] = fsin(k*0.055 + t*0.9);
+    const ph = t*14;
     for (let y=0,i=0;y<H;y++){
-      const sy = Math.sin(y*s2 - t*1.3);
+      const sy = fsin(y*s2 - t*1.3);
       for (let x=0;x<W;x++,i++){
-        const v = Math.sin(x*s1 + t*1.7)
-                + sy
-                + Math.sin((x+y)*0.055 + t*0.9)
-                + Math.sin(dist[i]*0.14 - t*2.1)
-                + Math.sin(dist2[i]*0.09 + t*1.1);
-        let idx = ((v+5)*(64/10) + t*14)|0;
-        T[i] = p[idx & 63];
+        const v = PL_AX[x] + sy + PL_AD[x+y]
+                + fsin(dist[i]*0.14 - t*2.1)
+                + fsin(dist2[i]*0.09 + t*1.1);
+        T[i] = p[(((v+5)*(64/10) + ph)|0) & 63];
       }
     }
   }});
@@ -460,22 +503,26 @@ const TAU = Math.PI*2;
   const RW=100, RH=75;
   const P = stops(16, [[0,[6,3,18]],[0.22,[26,10,54]],[0.45,[92,24,110]],[0.66,[205,52,124]],[0.85,[255,150,60]],[1,[255,250,225]]]);
   const smin=(a,b,k)=>{ const h=clamp(0.5+0.5*(b-a)/k,0,1); return b*(1-h)+a*h - k*h*(1-h); };
-  function map(x,y,z,t){
-    // rotate
-    const c1=Math.cos(t*0.7), s1=Math.sin(t*0.7);
+  // The rotation and the sphere radius are frame constants. map() runs ~48x per
+  // pixel (42 march steps + 6 for the normal), so computing them inside it cost
+  // 1.8M sin/cos per frame to get the same five numbers. Hoisted to setMap().
+  let c1=1,s1=0,c2=1,s2=0,sr=0.55;
+  function setMap(t){
+    c1=Math.cos(t*0.7);  s1=Math.sin(t*0.7);
+    c2=Math.cos(t*0.43); s2=Math.sin(t*0.43);
+    sr=0.55 + Math.sin(t*1.7)*0.22;
+  }
+  function map(x,y,z){
     let X=x*c1 - z*s1, Z=x*s1 + z*c1;
-    const c2=Math.cos(t*0.43), s2=Math.sin(t*0.43);
     let Y=y*c2 - Z*s2; Z=y*s2 + Z*c2;
-    // torus
     const q = Math.sqrt(X*X + Z*Z) - 0.95;
     const tor = Math.sqrt(q*q + Y*Y) - 0.30;
-    // pulsing sphere
-    const sr = 0.55 + Math.sin(t*1.7)*0.22;
     const sp = Math.sqrt(x*x+y*y+z*z) - sr;
     return smin(tor, sp, 0.45);
   }
   scenes.push({ name:'BLOBJECT', draw(T,t){
     const ro_z = -3.0;
+    setMap(t);
     for (let py=0;py<RH;py++){
       const uy = (py - RH*0.5)/RH * 1.5;
       for (let px=0;px<RW;px++){
@@ -483,19 +530,19 @@ const TAU = Math.PI*2;
         let rl = 1/Math.sqrt(ux*ux+uy*uy+1);
         const dx=ux*rl, dy=uy*rl, dz=1*rl;
         let d=0, hit=0;
-        for (let s=0;s<42;s++){
+        for (let s=0;s<34;s++){
           const cxp=dx*d, cyp=dy*d, czp=ro_z+dz*d;
-          const m=map(cxp,cyp,czp,t);
-          if (m<0.006){ hit=1; break; }
+          const m=map(cxp,cyp,czp);
+          if (m<0.012){ hit=1; break; }
           d+=m*0.9;
           if (d>7) break;
         }
         let col;
         if (hit){
+          // tetrahedral normal: 4 field samples instead of 6
           const X=dx*d, Y=dy*d, Z=ro_z+dz*d, e=0.02;
-          const nx=map(X+e,Y,Z,t)-map(X-e,Y,Z,t);
-          const ny=map(X,Y+e,Z,t)-map(X,Y-e,Z,t);
-          const nz=map(X,Y,Z+e,t)-map(X,Y,Z-e,t);
+          const d1=map(X+e,Y-e,Z-e), d2=map(X-e,Y-e,Z+e), d3=map(X-e,Y+e,Z-e), d4=map(X+e,Y+e,Z+e);
+          const nx=d1-d2-d3+d4, ny=-d1-d2+d3+d4, nz=-d1+d2-d3+d4;
           const nl=1/(Math.sqrt(nx*nx+ny*ny+nz*nz)+1e-6);
           const lx=0.577,ly=0.577,lz=-0.577;
           let dif = (nx*lx+ny*ly+nz*lz)*nl;
@@ -874,21 +921,23 @@ const TAU = Math.PI*2;
     sh.push([s,tr,cu]);
   }
   const zi=new Float32Array(N), idx=new Int32Array(N);
+  const pxs=new Float32Array(N), pys=new Float32Array(N);
+  const ord=new Array(N);                    // reused and sorted in place
   scenes.push({name:'BOBS',draw(T,t){
     vgrad(T,[2,2,10],[16,4,30]);
     const ph=(t*0.26)%3, m=ph|0, f=ph-m, m2=(m+1)%3;
     const fr=clamp((f-0.62)/0.38,0,1), ease=fr*fr*(3-2*fr);
     const ca=Math.cos(t*0.8),sa=Math.sin(t*0.8),cb=Math.cos(t*0.55),sb=Math.sin(t*0.55);
-    const pxs=new Float32Array(N),pys=new Float32Array(N);
     for(let i=0;i<N;i++){
-      const A=sh[i][m], B2=sh[i][m2];
-      let x=A[0]+(B2[0]-A[0])*ease, y=A[1]+(B2[1]-A[1])*ease, z=A[2]+(B2[2]-A[2])*ease;
+      const p0=sh[i][m], p1=sh[i][m2];       // A/B would shadow the framebuffers
+      let x=p0[0]+(p1[0]-p0[0])*ease, y=p0[1]+(p1[1]-p0[1])*ease, z=p0[2]+(p1[2]-p0[2])*ease;
       let y2=y*ca-z*sa, z2=y*sa+z*ca;
       let x2=x*cb+z2*sb; z2=-x*sb+z2*cb;
       const zz=z2+3.2, k=125/zz;
       pxs[i]=W*0.5+x2*k; pys[i]=H*0.5+y2*k; zi[i]=zz; idx[i]=i;
     }
-    const ord=Array.from(idx).sort((a,b)=>zi[b]-zi[a]);
+    for(let i=0;i<N;i++) ord[i]=idx[i];
+    ord.sort((a,b)=>zi[b]-zi[a]);
     for(let n=0;n<N;n++){
       const i=ord[n];
       const br=clamp(1.5-zi[i]*0.36,0.05,1);
@@ -909,21 +958,27 @@ const TAU = Math.PI*2;
 {
   const P=stops(96,[[0,[0,0,8]],[0.13,[16,10,90]],[0.30,[30,120,190]],[0.46,[230,246,255]],[0.60,[255,180,40]],[0.76,[180,30,20]],[0.9,[60,4,60]],[1,[0,0,8]]]);
   const CX=-0.7436438870371587, CY=0.13182590420533;
+  const MB_W=W>>1, MB_H=H>>1;
   scenes.push({name:'MANDELBROT',draw(T,t){
-    const cyc=(t*0.30)%1;
     const zoom=Math.exp(-(((t*0.52)%8.5)))*1.15;
     const sc=zoom*3.0/W;
     const it=clamp((60 + Math.log(1.15/zoom)*22)|0, 60, 145);
     const po=(t*22)|0;
-    for(let y=0,i=0;y<H;y++){
-      const ci=CY+(y-H*0.5)*sc;
-      for(let x=0;x<W;x++,i++){
-        const cr=CX+(x-W*0.5)*sc;
+    for(let py=0;py<MB_H;py++){
+      const ci=CY+(py*2-H*0.5)*sc, row=(py*2)*W;
+      for(let px=0;px<MB_W;px++){
+        const cr=CX+(px*2-W*0.5)*sc;
         let zr=0,zi2=0,zr2=0,zii=0,n=0;
         while(n<it && zr2+zii<16){ zi2=2*zr*zi2+ci; zr=zr2-zii+cr; zr2=zr*zr; zii=zi2*zi2; n++; }
-        if(n>=it){ T[i]=0xff000000; continue; }
-        const sm=n+1-Math.log(Math.log(Math.sqrt(zr2+zii)+1e-9)+1e-9)/0.6931472;
-        T[i]=P[(((sm*3.2+po)|0)%96+96)%96];
+        let c;
+        if(n>=it) c=0xff000000;
+        else {
+          // escaped, so zr2+zii >= 16 and log(sqrt(v)) is just 0.5*log(v)
+          const sm=n+1-Math.log(0.5*Math.log(zr2+zii)+1e-9)/0.6931472;
+          c=P[(((sm*3.2+po)|0)%96+96)%96];
+        }
+        const o=row+px*2;
+        T[o]=c; T[o+1]=c; T[o+W]=c; T[o+W+1]=c;
       }
     }
   }});
@@ -1006,7 +1061,7 @@ const TAU = Math.PI*2;
 
 /* MOIRE INTERFERENCE ------------------------------------------------------ */
 {
-  const A=stops(4,[[0,[255,40,110]],[0.34,[10,4,30]],[0.67,[60,240,220]],[1,[255,240,120]]]);
+  const PAL=stops(4,[[0,[255,40,110]],[0.34,[10,4,30]],[0.67,[60,240,220]],[1,[255,240,120]]]);
   scenes.push({name:'MOIRE',draw(T,t){
     const x1=W*0.5+Math.sin(t*0.7)*W*0.40, y1=H*0.5+Math.cos(t*0.9)*H*0.40;
     const x2=W*0.5+Math.sin(t*1.1+2)*W*0.40, y2=H*0.5+Math.cos(t*0.6+1)*H*0.40;
@@ -1016,7 +1071,7 @@ const TAU = Math.PI*2;
       let dx=x-x1, dy=y-y1; const r1=(Math.sqrt(dx*dx+dy*dy)*f)|0;
       dx=x-x2; dy=y-y2; const r2=(Math.sqrt(dx*dx+dy*dy)*f)|0;
       dx=x-x3; dy=y-y3; const r3=(Math.sqrt(dx*dx+dy*dy)*f*0.7)|0;
-      T[i]=A[((r1^r2)&1)|(((r2^r3)&1)<<1)];
+      T[i]=PAL[((r1^r2)&1)|(((r2^r3)&1)<<1)];
     }
   }});
 }
@@ -1241,16 +1296,21 @@ const TAU = Math.PI*2;
 {
   const RW=100, RH=75;
   const P=stops(16,[[0,[2,2,10]],[0.2,[18,10,60]],[0.42,[120,26,140]],[0.62,[255,70,110]],[0.8,[255,180,70]],[0.92,[255,240,190]],[1,[255,255,255]]]);
-  const RAD=0.34, CELL=3.0;
+  const RAD=0.34, CELL=3.0, INVCELL=1/CELL;
   function de(x,y,z){
-    const qx=((x%CELL)+CELL)%CELL-CELL*0.5;
-    const qy=((y%CELL)+CELL)%CELL-CELL*0.5;
-    const qz=((z%CELL)+CELL)%CELL-CELL*0.5;
-    const a=Math.sqrt(qy*qy+qz*qz)-RAD;
-    const b=Math.sqrt(qx*qx+qz*qz)-RAD;
-    const c=Math.sqrt(qx*qx+qy*qy)-RAD;
-    let d=a<b?a:b; if(c<d)d=c;
-    const s=Math.sqrt(qx*qx+qy*qy+qz*qz)-RAD*1.9;
+    // x - CELL*floor(x/CELL) is the same wrap as ((x%CELL)+CELL)%CELL for half
+    // the cost, and de() runs 76 times per pixel, so the two fmods per axis
+    // were most of this scene.
+    const qx=x-CELL*Math.floor(x*INVCELL)-CELL*0.5;
+    const qy=y-CELL*Math.floor(y*INVCELL)-CELL*0.5;
+    const qz=z-CELL*Math.floor(z*INVCELL)-CELL*0.5;
+    const xx=qx*qx, yy=qy*qy, zz=qz*qz;
+    // the three cylinders share RAD and sqrt is monotonic, so this is the same
+    // number as min(sqrt(yy+zz),sqrt(xx+zz),sqrt(xx+yy))-RAD for two fewer sqrt
+    const a=yy+zz, b=xx+zz, c=xx+yy;
+    let m=a<b?a:b; if(c<m)m=c;
+    const d=Math.sqrt(m)-RAD;
+    const s=Math.sqrt(xx+yy+zz)-RAD*1.9;
     return s<d?s:d;
   }
   scenes.push({name:'LATTICE',draw(T,t){
@@ -1265,16 +1325,21 @@ const TAU = Math.PI*2;
         let dx=vx*cy2+1*sy2, dy=vy, dz=-vx*sy2+1*cy2;
         const l=1/Math.sqrt(dx*dx+dy*dy+dz*dz); dx*=l;dy*=l;dz*=l;
         let d=0,s=0,hit=0;
-        for(s=0;s<70;s++){
+        // 0.004 was far finer than a half-res pixel ever resolves; at 0.012 the
+        // march terminates a few steps earlier with no visible difference.
+        for(s=0;s<56;s++){
           const m=de(cx+dx*d, cy+dy*d, cz+dz*d);
-          if(m<0.004){hit=1;break;}
+          if(m<0.012){hit=1;break;}
           d+=m*0.95;
           if(d>17)break;
         }
         let col;
         if(hit){
-          const e=0.01, X=cx+dx*d, Y=cy+dy*d, Z=cz+dz*d;
-          const nx=de(X+e,Y,Z)-de(X-e,Y,Z), ny=de(X,Y+e,Z)-de(X,Y-e,Z), nz=de(X,Y,Z+e)-de(X,Y,Z-e);
+          // tetrahedral normal: 4 field samples instead of 6, and it is
+          // renormalised below anyway
+          const e=0.012, X=cx+dx*d, Y=cy+dy*d, Z=cz+dz*d;
+          const d1=de(X+e,Y-e,Z-e), d2=de(X-e,Y-e,Z+e), d3=de(X-e,Y+e,Z-e), d4=de(X+e,Y+e,Z+e);
+          const nx=d1-d2-d3+d4, ny=-d1-d2+d3+d4, nz=-d1+d2-d3+d4;
           const nl=1/(Math.sqrt(nx*nx+ny*ny+nz*nz)+1e-9);
           const dif=clamp((nx*0.45+ny*0.62+nz*-0.65)*nl,0,1);
           const fog=clamp(1-d/15,0,1);
@@ -2734,11 +2799,13 @@ const TAU = Math.PI*2;
   }});
 
   /* 13 superfx flat-shaded ship */
+  const SFX_V=[[0,0,2],[-1,0,-1],[1,0,-1],[0,0.6,-0.8],[0,-0.4,-1]];
+  const SFX_F=[[0,1,3],[0,3,2],[0,2,4],[0,4,1],[1,2,3],[1,4,2]];
+  const FACEC=[rgb(220,60,70),rgb(180,40,50),rgb(240,140,80),rgb(120,30,40),rgb(200,200,220),rgb(90,20,30)];
   scenes.push({name:'SUPERFX',tag:'snes',draw(T,t){
     skyGrad(T,H,[4,6,30],[30,10,60]);
     for(let i=0;i<40;i++) pset(T,(i*67)%W,(i*29+((t*20)|0))%H,rgb(200,200,255));
-    const V=[[0,0,2],[-1,0,-1],[1,0,-1],[0,0.6,-0.8],[0,-0.4,-1]];
-    const F=[[0,1,3],[0,3,2],[0,2,4],[0,4,1],[1,2,3],[1,4,2]];
+    const V=SFX_V, F=SFX_F;
     const a=t*0.9, b=Math.sin(t*0.6)*0.5;
     const pr=v=>{
       let x=v[0],y=v[1],z=v[2];
@@ -2750,10 +2817,10 @@ const TAU = Math.PI*2;
     const P=V.map(pr);
     const fz=F.map((f,i)=>[i,(P[f[0]][2]+P[f[1]][2]+P[f[2]][2])/3]).sort((p,q)=>q[1]-p[1]);
     for(const [i] of fz){ const f=F[i];
-      const A=P[f[0]],B=P[f[1]],C=P[f[2]];
-      const cr=(B[0]-A[0])*(C[1]-A[1])-(B[1]-A[1])*(C[0]-A[0]);
+      const va=P[f[0]],vb=P[f[1]],vc=P[f[2]];   // A/B would shadow the framebuffers
+      const cr=(vb[0]-va[0])*(vc[1]-va[1])-(vb[1]-va[1])*(vc[0]-va[0]);
       if(cr<0)continue;
-      tri(T,A[0],A[1],B[0],B[1],C[0],C[1],[rgb(220,60,70),rgb(180,40,50),rgb(240,140,80),rgb(120,30,40),rgb(200,200,220),rgb(90,20,30)][i]);
+      tri(T,va[0],va[1],vb[0],vb[1],vc[0],vc[1],FACEC[i]);
     }
   }});
 
@@ -3043,7 +3110,7 @@ const TAU = Math.PI*2;
 
 /* ============================ AMIGA / ST / ARCADE PACK ============================ */
 {
-  const A=AMI;
+  const PAL=AMI;
   const copper=(T,t,y0,y1,ph)=>{ for(let y=y0;y<y1;y++){
     const f=(y-y0)/Math.max(1,y1-y0);
     hline(T,0,W-1,y,rgb((90+150*Math.sin(f*6+t+ph))|0,(70+120*Math.sin(f*5+t*1.3+ph))|0,(140+110*Math.sin(f*4+t*0.7+ph))|0)); } };
@@ -3118,7 +3185,7 @@ const TAU = Math.PI*2;
         for(let k=0;k<12;k++){
           const p=t*1.3+k*0.52;
           const x=W*0.5+Math.sin(p*1.1)*(W*0.40), y=H*0.5+Math.sin(p*1.7+k)*(H*0.38);
-          const c=A[1+(k%7)];
+          const c=PAL[1+(k%7)];
           for(let j=-5;j<=5;j++)for(let i=-5;i<=5;i++){ if(i*i+j*j>25)continue;
             pset(acc,x+i,y+j,(i*i+j*j<6)?rgb(255,255,255):c); }
         }
@@ -3203,7 +3270,7 @@ const TAU = Math.PI*2;
           pset(T,lx+x+2,ly+y+2,rgb(0,0,0));
           pset(T,lx+x,ly+y,rgb(255,240-y*5,60)); }
         for(let k=0;k<5;k++){ const y=(H*0.5+Math.sin(t*1.6+k*0.7)*22)|0;
-          for(let j=-3;j<=3;j++) hline(T,0,W-1,y+j,A[1+((k+j+7)%7)]); }
+          for(let j=-3;j<=3;j++) hline(T,0,W-1,y+j,PAL[1+((k+j+7)%7)]); }
         rect(T,0,H-26,W,26,rgb(0,0,0));
         const off=(t*54)%(sc.w+W);
         for(let x2=0;x2<W;x2++){ const u=((off+x2)|0)-W; if(u<0||u>=sc.w)continue;
@@ -3260,7 +3327,7 @@ const TAU = Math.PI*2;
       const a=t*1.1+k*0.7;
       const x=W*0.5+Math.sin(a)*70, z=Math.cos(a);
       const w=8+z*5, h=(40+z*30);
-      const c=A[1+(k%7)];
+      const c=PAL[1+(k%7)];
       const y=H*0.5-h*0.5+Math.sin(t*2+k)*10;
       for(let j=0;j<h;j++){
         const sh=clamp(0.4+z*0.4+ (1-Math.abs(j-h*0.5)/(h*0.5))*0.4,0,1);
@@ -3271,15 +3338,24 @@ const TAU = Math.PI*2;
 
   /* 13 sine scroller over plasma */
   { let m=null;
+    const ST_N=1024, ST_SC=ST_N/6;
+    const ST_P=ramp(ST_N,-3,3,v=>rgb((100+80*Math.sin(v*2))|0,(60+60*Math.sin(v*2+2))|0,(150+100*Math.sin(v*2+4))|0));
+    const ST_AX=new Float32Array(W), ST_AD=new Float32Array(W+H);
     scenes.push({name:'SINETEXT',tag:'amiga',reset(){m=textMask('AMIGA 500',30);},
       draw(T,t){ if(!m)this.reset();
-        for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-          const v=Math.sin(x*0.05+t)+Math.sin(y*0.06-t*1.3)+Math.sin((x+y)*0.03+t*0.7);
-          T[y*W+x]=rgb((100+80*Math.sin(v*2))|0,(60+60*Math.sin(v*2+2))|0,(150+100*Math.sin(v*2+4))|0);
+        for(let x=0;x<W;x++)   ST_AX[x]=fsin(x*0.05+t);
+        for(let k=0;k<W+H;k++) ST_AD[k]=fsin(k*0.03+t*0.7);
+        for(let y=0;y<H;y++){
+          const sy=fsin(y*0.06-t*1.3), row=y*W;
+          for(let x=0;x<W;x++){
+            let k=((ST_AX[x]+sy+ST_AD[x+y]+3)*ST_SC)|0;
+            if(k<0)k=0; else if(k>ST_N)k=ST_N;
+            T[row+x]=ST_P[k];
+          }
         }
         const off=(t*40)%(m.w+W);
         for(let x=0;x<W;x++){ const u=((off+x)|0)-W; if(u<0||u>=m.w)continue;
-          const yo=Math.sin(x*0.05+t*2.5)*24;
+          const yo=fsin(x*0.05+t*2.5)*24;
           for(let y=0;y<m.h;y++) if(m.a[y*m.w+u]){
             pset(T,x,H*0.5-m.h*0.5+y+yo+2,rgb(0,0,40));
             pset(T,x,H*0.5-m.h*0.5+y+yo,rgb(255,255,255)); } }
@@ -3489,15 +3565,21 @@ const TAU = Math.PI*2;
   }});
 
   /* 25 plasma + bob overlay */
+  const APL_D=new Float32Array(W*H), APL_AX=new Float32Array(W);
+  for(let y=0,i=0;y<H;y++)for(let x=0;x<W;x++,i++)
+    APL_D[i]=Math.sqrt((x-100)**2+(y-75)**2)*0.1;
   scenes.push({name:'AMIGAPLASMA',tag:'amiga',draw(T,t){
-    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-      const v=Math.sin(x*0.07+t*1.3)+Math.sin(y*0.08-t)+Math.sin(Math.sqrt((x-100)**2+(y-75)**2)*0.1+t*1.7);
-      const i=((v+3)*5.3)|0;
-      T[y*W+x]=A[i%8];
+    for(let x=0;x<W;x++) APL_AX[x]=fsin(x*0.07+t*1.3);
+    for(let y=0,i=0;y<H;y++){
+      const sy=fsin(y*0.08-t), row=y*W;
+      for(let x=0;x<W;x++,i++){
+        const v=APL_AX[x]+sy+fsin(APL_D[i]+t*1.7);
+        T[row+x]=PAL[(((v+3)*5.3)|0)%8];
+      }
     }
     for(let k=0;k<6;k++){
-      const x=W*0.5+Math.sin(t*1.4+k)*70, y=H*0.5+Math.cos(t*1.1+k*1.3)*46;
-      disc(T,x,y,7,rgb(255,255,255)); disc(T,x,y,4,A[1+(k%7)]);
+      const x=W*0.5+fsin(t*1.4+k)*70, y=H*0.5+fcos(t*1.1+k*1.3)*46;
+      disc(T,x,y,7,rgb(255,255,255)); disc(T,x,y,4,PAL[1+(k%7)]);
     }
   }});
 
@@ -3506,7 +3588,7 @@ const TAU = Math.PI*2;
     T.fill(rgb(4,4,14));
     for(let x=0;x<W;x+=6){
       const h=40+Math.sin(x*0.06+t*2.4)*32+Math.sin(x*0.021-t*1.3)*18;
-      const c=A[1+(((x/6)|0)%7)];
+      const c=PAL[1+(((x/6)|0)%7)];
       for(let j=0;j<h;j++){
         const sh=1-j/h*0.6;
         hline(T,x,x+4,H*0.5-h*0.5+j,rgb((c&255)*sh|0,((c>>8)&255)*sh|0,((c>>16)&255)*sh|0));
@@ -4205,28 +4287,38 @@ const TAU = Math.PI*2;
 {
   const FP=stops(72,[[0,[4,2,20]],[0.16,[20,10,120]],[0.34,[20,180,220]],[0.5,[250,250,230]],
                      [0.66,[255,170,40]],[0.82,[190,20,60]],[1,[4,2,20]]]);
-  const escape=(T,t,fn,it,sc,cx,cy,po)=>{
-    for(let y=0,i=0;y<H;y++){ const y0=(y-H*0.5)*sc+cy;
-      for(let x=0;x<W;x++,i++){ const x0=(x-W*0.5)*sc+cx;
+  // Half-res into 2x2 blocks, per the house rule for expensive effects. This
+  // pack was the one that ignored it: at full res the escape-time boundary is
+  // a one-pixel-wide band that shimmers into noise on a CRT anyway, so the
+  // coarser version is both 4x cheaper and easier to look at.
+  const EW = W >> 1, EH = H >> 1;
+  const escape=(T,fn,it,sc,cx,cy,po)=>{
+    for(let py=0;py<EH;py++){ const y0=(py*2-H*0.5)*sc+cy; const row=(py*2)*W;
+      for(let px=0;px<EW;px++){ const x0=(px*2-W*0.5)*sc+cx;
         const n=fn(x0,y0,it);
-        T[i]= n<0 ? 0xff000000 : FP[((((n*3.4+po)|0)%72)+72)%72];
+        const c = n<0 ? 0xff000000 : FP[((((n*3.4+po)|0)%72)+72)%72];
+        const o=row+px*2;
+        T[o]=c; T[o+1]=c; T[o+W]=c; T[o+W+1]=c;
       } }
   };
 
   /* 1 burning ship */
   scenes.push({name:'BURNINGSHIP',tag:'frac',draw(T,t){
     const z=Math.exp(-((t*0.42)%7))*1.4;
-    escape(T,t,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
+    escape(T,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
       while(n<it&&zr*zr+zi*zi<16){ const a=Math.abs(zr),b=Math.abs(zi);
         const nr=a*a-b*b+cr; zi=2*a*b+ci; zr=nr; n++; }
       return n>=it?-1:n; },90,z*3/W,-1.755,-0.03,t*20);
   }});
 
   /* 2 newton basins */
+  // The basin colours were a nested array literal *inside* the pixel loop:
+  // four allocations per pixel, 120k of garbage a frame. Flattened and hoisted.
+  const NW_C=[255,90,90, 90,255,140, 110,130,255];
   scenes.push({name:'NEWTON',tag:'frac',draw(T,t){
-    const sc=3.2/W, sh=Math.sin(t*0.4)*0.5;
-    for(let y=0,i=0;y<H;y++){ const y0=(y-H*0.5)*sc;
-      for(let x=0;x<W;x++,i++){ let zr=(x-W*0.5)*sc, zi=y0, n=0;
+    const sc=3.2/W, tint=1+Math.sin(t*0.4)*0.1;
+    for(let py=0;py<EH;py++){ const y0=(py*2-H*0.5)*sc, row=(py*2)*W;
+      for(let px=0;px<EW;px++){ let zr=(px*2-W*0.5)*sc, zi=y0, n=0;
         for(;n<22;n++){
           const r2=zr*zr, i2=zi*zi;
           const dr=3*(r2-i2), di=6*zr*zi;
@@ -4236,17 +4328,17 @@ const TAU = Math.PI*2;
           zr-=qr; zi-=qi;
           if(qr*qr+qi*qi<1e-6)break;
         }
-        const a=Math.atan2(zi,zr);
-        const k=((a+3.1416)/6.2832*3)|0;
+        const k=((((fatan2(zi,zr)+3.1416)/6.2832*3)|0)%3)*3;
         const sh2=1-n/22;
-        const c=[[255,90,90],[90,255,140],[110,130,255]][k%3];
-        T[i]=rgb(c[0]*sh2*(0.5+sh*0.2+0.5)|0,c[1]*sh2|0,c[2]*sh2|0);
+        const c=rgb(NW_C[k]*sh2*tint|0, NW_C[k+1]*sh2|0, NW_C[k+2]*sh2|0);
+        const o=row+px*2;
+        T[o]=c; T[o+1]=c; T[o+W]=c; T[o+W+1]=c;
       } }
   }});
 
   /* 3 tricorn */
   scenes.push({name:'TRICORN',tag:'frac',draw(T,t){
-    escape(T,t,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
+    escape(T,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
       while(n<it&&zr*zr+zi*zi<16){ const nr=zr*zr-zi*zi+cr; zi=-2*zr*zi+ci; zr=nr; n++; }
       return n>=it?-1:n; },70,3.2/W*(1+Math.sin(t*0.3)*0.3),-0.2,0,t*18);
   }});
@@ -4254,7 +4346,7 @@ const TAU = Math.PI*2;
   /* 4 phoenix */
   scenes.push({name:'PHOENIX',tag:'frac',draw(T,t){
     const p=-0.5+Math.sin(t*0.3)*0.2;
-    escape(T,t,(x0,y0,it)=>{ let zr=y0,zi=x0,pr=0,pi=0,n=0;
+    escape(T,(x0,y0,it)=>{ let zr=y0,zi=x0,pr=0,pi=0,n=0;
       const cr=0.5667, ci=0;
       while(n<it&&zr*zr+zi*zi<16){
         const nr=zr*zr-zi*zi+cr+p*pr, ni=2*zr*zi+ci+p*pi;
@@ -4263,31 +4355,42 @@ const TAU = Math.PI*2;
   }});
 
   /* 5 multibrot morph */
+  // Was the most expensive scene in the file by 2.4x: pow+atan2+cos+sin every
+  // iteration, 32 iterations, every pixel. LUT trig plus carrying |z|^2 across
+  // the loop instead of recomputing it leaves pow as the only libm call.
   scenes.push({name:'MULTIBROT',tag:'frac',draw(T,t){
-    const pw=2+((t*0.25)%6);
-    escape(T,t,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
-      while(n<it&&zr*zr+zi*zi<16){
-        const r=Math.pow(zr*zr+zi*zi,pw*0.5), a=Math.atan2(zi,zr)*pw;
-        zr=r*Math.cos(a)+cr; zi=r*Math.sin(a)+ci; n++; }
-      return n>=it?-1:n; },32,3.4/W,-0.2,0,t*16);
+    const pw=2+((t*0.25)%6), hp=pw*0.5;
+    escape(T,(cr,ci,it)=>{ let zr=0,zi=0,n=0,m2=0;
+      while(n<it&&m2<16){
+        const r=Math.pow(m2,hp), a=fatan2(zi,zr)*pw;
+        zr=r*fcos(a)+cr; zi=r*fsin(a)+ci; m2=zr*zr+zi*zi; n++; }
+      return n>=it?-1:n; },26,3.4/W,-0.2,0,t*16);
   }});
 
   /* 6 lyapunov */
+  // The palette and the AABAB sequence are constants; they were being rebuilt
+  // every frame. The sin was loop-invariant but sat in the inner loop. Half-res
+  // like the rest of the pack - the filaments are sub-pixel at 200x150 either way.
+  const LY_P=stops(48,[[0,[0,0,20]],[0.45,[20,60,140]],[0.55,[250,240,180]],[0.75,[240,150,40]],[1,[90,10,10]]]);
+  const LY_SEQ=(()=>{ const q=[0,0,1,0,1,1], u=new Uint8Array(48);
+    for(let n=0;n<48;n++) u[n]=q[n%6]; return u; })();
   scenes.push({name:'LYAPUNOV',tag:'frac',draw(T,t){
-    const seq=[0,0,1,0,1,1];
-    const P=stops(48,[[0,[0,0,20]],[0.45,[20,60,140]],[0.55,[250,240,180]],[0.75,[240,150,40]],[1,[90,10,10]]]);
-    for(let y=0,i=0;y<H;y++){
-      const b=2.4+(y/H)*1.6;
-      for(let x=0;x<W;x++,i++){
-        const a=2.4+(x/W)*1.6+Math.sin(t*0.2)*0.05;
+    const wob=Math.sin(t*0.2)*0.05;
+    for(let py=0;py<EH;py++){
+      const b=2.4+((py*2)/H)*1.6, row=(py*2)*W;
+      for(let px=0;px<EW;px++){
+        const a=2.4+((px*2)/W)*1.6+wob;
         let v=0.5, s=0;
-        for(let n=0;n<48;n++){
-          const r=seq[n%6]?b:a;
+        for(let n=0;n<9;n++){ v=(LY_SEQ[n]?b:a)*v*(1-v); }
+        for(let n=9;n<48;n++){
+          const r=LY_SEQ[n]?b:a;
           v=r*v*(1-v);
-          if(n>8) s+=Math.log(Math.abs(r*(1-2*v))+1e-9);
+          s+=Math.log(Math.abs(r*(1-2*v))+1e-9);
         }
         s/=40;
-        T[i]=P[clamp(((s+1)*24)|0,0,47)];
+        const c=LY_P[clamp(((s+1)*24)|0,0,47)];
+        const o=row+px*2;
+        T[o]=c; T[o+1]=c; T[o+W]=c; T[o+W+1]=c;
       }
     }
   }});
@@ -4425,20 +4528,24 @@ const TAU = Math.PI*2;
   }});
 
   /* 14 orbit trap julia */
+  const OT_P=ramp(256,0,1,v=>rgb((v*v*255)|0,(v*160)|0,(60+v*195)|0));
   scenes.push({name:'ORBITTRAP',tag:'frac',draw(T,t){
     const cr=0.7885*Math.cos(t*0.2), ci=0.7885*Math.sin(t*0.2);
     const sc=3.0/W;
-    for(let y=0,i=0;y<H;y++){ const y0=(y-H*0.5)*sc;
-      for(let x=0;x<W;x++,i++){
-        let zr=(x-W*0.5)*sc, zi=y0, trap=1e9;
+    for(let py=0;py<EH;py++){ const y0=(py*2-H*0.5)*sc, row=(py*2)*W;
+      for(let px=0;px<EW;px++){
+        let zr=(px*2-W*0.5)*sc, zi=y0, trap=1e9;
         for(let n=0;n<40;n++){
           const nr=zr*zr-zi*zi+cr; zi=2*zr*zi+ci; zr=nr;
-          const d=Math.abs(Math.min(Math.abs(zr),Math.abs(zi)));
+          const ar=zr<0?-zr:zr, ai=zi<0?-zi:zi;   // min of two abs is already >= 0
+          const d=ar<ai?ar:ai;
           if(d<trap)trap=d;
           if(zr*zr+zi*zi>16)break;
         }
-        const v=clamp(1-trap*3.2,0,1);
-        T[i]=rgb((v*v*255)|0,(v*160)|0,(60+v*195)|0);
+        const v=1-trap*3.2;
+        const c=OT_P[v<=0?0:(v>=1?256:(v*256)|0)];
+        const o=row+px*2;
+        T[o]=c; T[o+1]=c; T[o+W]=c; T[o+W+1]=c;
       } }
   }});
 
@@ -4567,6 +4674,9 @@ const TAU = Math.PI*2;
 
   /* 21 DLA */
   { const GW=100,GH=75; let g=null, mr=2;
+    const DLA_P=new Uint32Array(61);
+    DLA_P[0]=rgb(4,4,16);
+    for(let v=1;v<61;v++) DLA_P[v]=rgb(80+((v*3)%175),120+((v*5)%135),255);
     scenes.push({name:'DLA',tag:'auto',
       reset(){ g=new Uint8Array(GW*GH); g[((GH>>1)*GW)+(GW>>1)]=1; mr=2; },
       draw(T,t){ if(!g)this.reset();
@@ -4584,8 +4694,7 @@ const TAU = Math.PI*2;
           }
         }
         for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){
-          const v=g[y*GW+x];
-          const c=v?rgb(80+((v*3)%175),120+((v*5)%135),255):rgb(4,4,16);
+          const c=DLA_P[g[y*GW+x]];
           const o=(y*2)*W+x*2; T[o]=c;T[o+1]=c;T[o+W]=c;T[o+W+1]=c; }
       }});
   }
@@ -4689,30 +4798,48 @@ const TAU = Math.PI*2;
   }
 
   /* 26 worley cells */
+  // A cell's feature point depends on the cell, not on the pixel looking at it.
+  // This was doing 18 hash2 and 18 trig calls per pixel to rebuild the same 80
+  // points 30000 times a frame; now it builds them once and indexes them.
+  const WOR_S=26;
+  const WOR_GW=(((W-1)/WOR_S)|0)+3, WOR_GH=(((H-1)/WOR_S)|0)+3;
+  const WOR_FX=new Float32Array(WOR_GW*WOR_GH), WOR_FY=new Float32Array(WOR_GW*WOR_GH);
+  const WOR_P=new Uint32Array(257);
+  for(let k=0;k<=256;k++){ const v=k/256; WOR_P[k]=rgb((v*90)|0,(40+v*180)|0,(120+v*120)|0); }
   scenes.push({name:'WORLEY',tag:'auto',draw(T,t){
-    const S=26;
-    for(let y=0,i=0;y<H;y++)for(let x=0;x<W;x++,i++){
-      const gx=(x/S)|0, gy=(y/S)|0;
-      let best=1e9;
-      for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
-        const cx2=gx+dx, cy2=gy+dy;
-        const h=hash2(cx2,cy2), h2=hash2(cy2,cx2);
-        const fx=(cx2+0.5+Math.sin(t*0.8+h*6.28)*0.4)*S, fy=(cy2+0.5+Math.cos(t*0.7+h2*6.28)*0.4)*S;
-        const d=(x-fx)**2+(y-fy)**2;
-        if(d<best)best=d;
+    const S=WOR_S;
+    for(let cy=0;cy<WOR_GH;cy++)for(let cx=0;cx<WOR_GW;cx++){
+      const gx=cx-1, gy=cy-1, k=cy*WOR_GW+cx;
+      const h=hash2(gx,gy), h2=hash2(gy,gx);
+      WOR_FX[k]=(gx+0.5+fsin(t*0.8+h*6.28)*0.4)*S;
+      WOR_FY[k]=(gy+0.5+fcos(t*0.7+h2*6.28)*0.4)*S;
+    }
+    for(let y=0,i=0;y<H;y++){
+      const gy=(y/S)|0;
+      for(let x=0;x<W;x++,i++){
+        const gx=(x/S)|0;
+        let best=1e9;
+        for(let dy=0;dy<3;dy++){
+          const base=(gy+dy)*WOR_GW+gx;
+          for(let dx=0;dx<3;dx++){
+            const k=base+dx, ex=x-WOR_FX[k], ey=y-WOR_FY[k];
+            const d=ex*ex+ey*ey;
+            if(d<best)best=d;
+          }
+        }
+        const v=Math.sqrt(best)/S;
+        T[i]=WOR_P[v>=1?256:(v*256)|0];
       }
-      const v=clamp(Math.sqrt(best)/S,0,1);
-      T[i]=rgb((v*90)|0,(40+v*180)|0,(120+v*120)|0);
     }
   }});
 
   /* 27 buddhabrot-ish accumulation */
   { const acc=new Float32Array(W*H);
+    const path=new Float64Array(64);          // scratch; was reallocated per frame
     scenes.push({name:'BUDDHA',tag:'frac',
       reset(){ acc.fill(0); },
       draw(T,t){
         for(let i=0;i<W*H;i++) acc[i]*=0.985;
-        const path=new Float64Array(64);
         for(let s=0;s<260;s++){
           const cr=Math.random()*3.2-2.1, ci=Math.random()*2.4-1.2;
           let zr=0,zi=0,n=0;
@@ -4806,17 +4933,19 @@ const TAU = Math.PI*2;
   }
 
   /* 31 julia dust / dendrite gallery */
+  const JG_CS=[[-0.4,0.6],[0.285,0.01],[-0.70176,-0.3842],[-0.835,-0.2321],[-0.8,0.156],[0.37,0.1]];
   scenes.push({name:'JULIAGALLERY',tag:'frac',draw(T,t){
     const idx=((t*0.35)|0)%6;
-    const CS=[[-0.4,0.6],[0.285,0.01],[-0.70176,-0.3842],[-0.835,-0.2321],[-0.8,0.156],[0.37,0.1]];
-    const c0=CS[idx], c1=CS[(idx+1)%6], f=((t*0.35)%1);
+    const c0=JG_CS[idx], c1=JG_CS[(idx+1)%6], f=((t*0.35)%1);
     const cr=c0[0]+(c1[0]-c0[0])*f, ci=c0[1]+(c1[1]-c0[1])*f;
-    const sc=3.0/W;
-    for(let y=0,i=0;y<H;y++){ const y0=(y-H*0.5)*sc;
-      for(let x=0;x<W;x++,i++){
-        let zr=(x-W*0.5)*sc, zi=y0, n=0;
+    const sc=3.0/W, po=(t*20)|0;
+    for(let py=0;py<EH;py++){ const y0=(py*2-H*0.5)*sc, row=(py*2)*W;
+      for(let px=0;px<EW;px++){
+        let zr=(px*2-W*0.5)*sc, zi=y0, n=0;
         while(n<60&&zr*zr+zi*zi<16){ const nr=zr*zr-zi*zi+cr; zi=2*zr*zi+ci; zr=nr; n++; }
-        T[i]= n>=60 ? rgb(8,4,20) : FP[(((n*4+((t*20)|0))%72)+72)%72];
+        const c= n>=60 ? rgb(8,4,20) : FP[(((n*4+po)%72)+72)%72];
+        const o=row+px*2;
+        T[o]=c; T[o+1]=c; T[o+W]=c; T[o+W+1]=c;
       } }
   }});
 
@@ -4825,7 +4954,7 @@ const TAU = Math.PI*2;
     const SP=[[-1.7687,0.0017,0.006],[0.2929,0.0149,0.004],[-0.1592,-1.0317,0.006],[-0.7453,0.1127,0.006]];
     const s=SP[((t*0.14)|0)%4];
     const z=s[2]*(1.6+Math.sin(t*0.5)*0.5);
-    escape(T,t,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
+    escape(T,(cr,ci,it)=>{ let zr=0,zi=0,n=0;
       while(n<it&&zr*zr+zi*zi<16){ const nr=zr*zr-zi*zi+cr; zi=2*zr*zi+ci; zr=nr; n++; }
       return n>=it?-1:n; },130,z/W*4,s[0],s[1],t*14);
   }});
@@ -5422,49 +5551,86 @@ const TAU = Math.PI*2;
   }});
 
   /* 27 pixel sort glitch */
+  // Two rewrites: the backdrop's sines are separable (one table over x, one over
+  // x+y, one constant per row) and its tail is a ramp; and the sort is a stable
+  // counting sort on the 8-bit luminance instead of Array#sort with a comparator
+  // closure over a freshly allocated array per row.
+  const PS_N=1024, PS_SC=PS_N/6;
+  const PS_P=ramp(PS_N,-3,3,v=>rgb((128+120*Math.sin(v*2))|0,(128+120*Math.sin(v*2+2))|0,(128+120*Math.sin(v*2+4))|0));
+  const PS_AX=new Float32Array(W), PS_AD=new Float32Array(W+H);
+  const PS_CNT=new Int32Array(256), PS_KEY=new Uint8Array(W), PS_TMP=new Uint32Array(W);
   scenes.push({name:'PIXELSORT',tag:'misc',draw(T,t){
-    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-      const v=Math.sin(x*0.05+t)+Math.sin(y*0.06-t*1.2)+Math.sin((x+y)*0.03+t*0.6);
-      T[y*W+x]=rgb((128+120*Math.sin(v*2))|0,(128+120*Math.sin(v*2+2))|0,(128+120*Math.sin(v*2+4))|0);
+    for(let x=0;x<W;x++)   PS_AX[x]=fsin(x*0.05+t);
+    for(let k=0;k<W+H;k++) PS_AD[k]=fsin(k*0.03+t*0.6);
+    for(let y=0;y<H;y++){
+      const sy=fsin(y*0.06-t*1.2), row=y*W;
+      for(let x=0;x<W;x++){
+        let k=((PS_AX[x]+sy+PS_AD[x+y]+3)*PS_SC)|0;
+        if(k<0)k=0; else if(k>PS_N)k=PS_N;
+        T[row+x]=PS_P[k];
+      }
     }
-    const lum=c=>(c&255)*0.3+((c>>8)&255)*0.6+((c>>16)&255)*0.1;
     for(let y=0;y<H;y++){
       if(((y*7+((t*20)|0))%11)>5)continue;
-      const start=((Math.sin(y*0.1+t)*0.5+0.5)*W*0.4)|0;
-      const len=40+((y*13)%80);
       const row=y*W;
-      const seg=[];
-      for(let x=start;x<Math.min(W,start+len);x++) seg.push(T[row+x]);
-      seg.sort((a,b)=>lum(a)-lum(b));
-      for(let i=0;i<seg.length;i++) T[row+start+i]=seg[i];
+      const start=((fsin(y*0.1+t)*0.5+0.5)*W*0.4)|0;
+      const end=Math.min(W,start+40+((y*13)%80)), m=end-start;
+      if(m<2)continue;
+      PS_CNT.fill(0);
+      for(let x=0;x<m;x++){
+        const c=T[row+start+x];
+        const k=((c&255)*0.3+((c>>8)&255)*0.6+((c>>16)&255)*0.1)|0;
+        PS_KEY[x]=k; PS_TMP[x]=c; PS_CNT[k]++;
+      }
+      let acc=0;
+      for(let k=0;k<256;k++){ const q=PS_CNT[k]; PS_CNT[k]=acc; acc+=q; }
+      for(let x=0;x<m;x++) T[row+start+(PS_CNT[PS_KEY[x]]++)]=PS_TMP[x];
     }
   }});
 
   /* 28 kaleidoscope */
+  // The wedge fold and the radius don't move - only the spin does. Both are
+  // baked once at load, which removes an atan2 and a sqrt from every pixel.
+  const KA_SEG=6.2832/6;
+  const KA_A=new Float32Array(W*H), KA_R=new Float32Array(W*H);
+  for(let y=0,i=0;y<H;y++)for(let x=0;x<W;x++,i++){
+    const dx=x-W*0.5, dy=y-H*0.5;
+    let a=Math.atan2(dy,dx);
+    a=((a%KA_SEG)+KA_SEG)%KA_SEG;
+    if(a>KA_SEG*0.5)a=KA_SEG-a;
+    KA_A[i]=a; KA_R[i]=Math.sqrt(dx*dx+dy*dy);
+  }
+  const KA_N=1024, KA_SC=KA_N/6;
+  const KA_P=ramp(KA_N,-3,3,q=>rgb((128+120*Math.sin(q*2))|0,(128+120*Math.sin(q*2+2.1))|0,(128+120*Math.sin(q*2+4.2))|0));
   scenes.push({name:'KALEIDO',tag:'misc',draw(T,t){
-    const N=6;
-    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-      const dx=x-W*0.5, dy=y-H*0.5;
-      let a=Math.atan2(dy,dx), r=Math.sqrt(dx*dx+dy*dy);
-      const seg=6.2832/N;
-      a=((a%seg)+seg)%seg;
-      if(a>seg*0.5)a=seg-a;
-      a+=t*0.25;
-      const u=Math.cos(a)*r, v=Math.sin(a)*r;
-      const q=Math.sin(u*0.09+t)+Math.sin(v*0.11-t*1.3)+Math.sin((u+v)*0.05+t*0.6);
-      T[y*W+x]=rgb((128+120*Math.sin(q*2))|0,(128+120*Math.sin(q*2+2.1))|0,(128+120*Math.sin(q*2+4.2))|0);
+    const sp=t*0.25;
+    for(let i=0;i<W*H;i++){
+      const a=KA_A[i]+sp, r=KA_R[i];
+      const u=fcos(a)*r, v=fsin(a)*r;
+      let k=((fsin(u*0.09+t)+fsin(v*0.11-t*1.3)+fsin((u+v)*0.05+t*0.6)+3)*KA_SC)|0;
+      if(k<0)k=0; else if(k>KA_N)k=KA_N;
+      T[i]=KA_P[k];
     }
   }});
 
   /* 29 mirrored tiles */
+  // The mirrored tile coordinates are fixed for a given pixel - bake them.
+  const MT_S=50;
+  const MT_U=new Uint8Array(W*H), MT_V=new Uint8Array(W*H);
+  for(let y=0,i=0;y<H;y++)for(let x=0;x<W;x++,i++){
+    let u=x%MT_S, v=y%MT_S;
+    if((((x/MT_S)|0)&1)) u=MT_S-1-u;
+    if((((y/MT_S)|0)&1)) v=MT_S-1-v;
+    MT_U[i]=u; MT_V[i]=v;
+  }
+  const MT_N=1024, MT_SC=MT_N/6;
+  const MT_P=ramp(MT_N,-3,3,q=>rgb((120+110*Math.sin(q*1.7))|0,(60+90*Math.sin(q*1.7+2))|0,(180+70*Math.sin(q*1.7+4))|0));
   scenes.push({name:'MIRRORTILE',tag:'misc',draw(T,t){
-    const S=50;
-    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-      let u=x%S, v=y%S;
-      if((((x/S)|0)&1)) u=S-1-u;
-      if((((y/S)|0)&1)) v=S-1-v;
-      const q=Math.sin(u*0.16+t*1.4)+Math.sin(v*0.14-t)+Math.sin((u*v)*0.006+t*0.5);
-      T[y*W+x]=rgb((120+110*Math.sin(q*1.7))|0,(60+90*Math.sin(q*1.7+2))|0,(180+70*Math.sin(q*1.7+4))|0);
+    for(let i=0;i<W*H;i++){
+      const u=MT_U[i], v=MT_V[i];
+      let k=((fsin(u*0.16+t*1.4)+fsin(v*0.14-t)+fsin((u*v)*0.006+t*0.5)+3)*MT_SC)|0;
+      if(k<0)k=0; else if(k>MT_N)k=MT_N;
+      T[i]=MT_P[k];
     }
   }});
 
@@ -5552,8 +5718,15 @@ function jump(i){
 }
 function now(){ return performance.now()/1000 - started; }
 
+// Smoothed cost of the last few frames, in ms. The only thing it drives is
+// whether a transition can afford to redraw both scenes every frame; on a
+// desktop it sits far below the threshold and nothing changes.
+let cost = 0, tick = 0;
+const BUDGET = 12;                         // ms of a 16.7ms frame we'll spend
+
 function frame(){
   requestAnimationFrame(frame);
+  const f0 = performance.now();
   const t = now();
   let dt = t - last; last = t;
   if (dt > 0.1) dt = 0.1;
@@ -5564,11 +5737,16 @@ function frame(){
 
   if (!hold && local > LEN - TRANS){
     if (nxt < 0){ nxt = (cur+1) % scenes.length; enter(nxt); B.fill(0xff000000); }
-    scenes[nxt].draw(B, t, dt);
+    // A transition is the only moment two scenes render in one frame, so it is
+    // the worst case on slow hardware. If we're already over budget, refresh the
+    // incoming scene every other frame: B persists, and the dither threshold
+    // still advances every frame, so the dissolve itself stays smooth.
+    if (cost < BUDGET || (tick & 1) === 0) scenes[nxt].draw(B, t, dt);
     const p = (local - (LEN - TRANS)) / TRANS;
     const thr = p*p*(3-2*p) * 64;
-    for (let y=0,i=0;y<H;y++) for (let x=0;x<W;x++,i++){
-      if (bay(x,y) < thr) A[i] = B[i];
+    for (let y=0,i=0;y<H;y++){
+      const br=(y&7)<<3;
+      for (let x=0;x<W;x++,i++) if (BY[br|(x&7)] < thr) A[i] = B[i];
     }
   }
   if (!hold && local >= LEN){
@@ -5579,6 +5757,10 @@ function frame(){
   drawFlash(A, t);
 
   ctx.putImageData(imgA, 0, 0);
+
+  tick++;
+  cost += ((performance.now() - f0) - cost) * 0.1;
+  if (hudOn) hudTick(dt);
 }
 
 // opt-in effect-name overlay - press I. Nothing is shown unless asked for.
@@ -5628,8 +5810,23 @@ fit();
 
 // ---------------------------------------------------------------- input
 const hud = document.getElementById('hud');
-let hudT = 0;
-function showHud(){ hud.classList.add('on'); clearTimeout(hudT); hudT=setTimeout(()=>hud.classList.remove('on'), 2500); }
+const HUD_TXT = hud.textContent;
+let hudT = 0, hudOn = false, fps = 60, hudNext = 0;
+function showHud(){
+  hud.classList.add('on'); hudOn = true;
+  clearTimeout(hudT);
+  hudT = setTimeout(()=>{ hud.classList.remove('on'); hudOn = false; }, 2500);
+}
+// Only runs while the HUD is actually visible. Worth having on the target
+// hardware: it is the quickest way to see whether a given effect holds 60.
+function hudTick(dt){
+  if (dt > 0) fps += (1/dt - fps) * 0.05;
+  const n = performance.now();
+  if (n < hudNext) return;
+  hudNext = n + 250;
+  hud.textContent = HUD_TXT + '  \u00b7  ' + scenes[cur].name +
+                    '  ' + fps.toFixed(0) + 'fps  ' + cost.toFixed(1) + 'ms';
+}
 showHud();
 
 addEventListener('keydown', e => {
